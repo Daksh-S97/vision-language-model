@@ -5,7 +5,7 @@ import torch.nn as nn
 class SiglipVisionConfig:
 
     def __init__(
-            self, hidden_size=768, intermediate_size=3072, num_hidden_layers=12, num_attention_layers=12, num_channels=3, img_size=224, patch_size=16,
+            self, hidden_size=768, intermediate_size=3072, num_hidden_layers=12, num_attention_heads=12, num_channels=3, img_size=224, patch_size=16,
             layer_norm_eps=1e-6, attention_dropout=0.0, num_image_tokens: int = None, **kwargs
     ):
         super().__init__()
@@ -13,7 +13,7 @@ class SiglipVisionConfig:
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
-        self.num_attention_layers = num_attention_layers
+        self.num_attention_heads = num_attention_heads
         self.num_channels = num_channels
         self.img_size = img_size
         self.patch_size = patch_size
@@ -62,14 +62,49 @@ class SiglipMLP(nn.Module):
         hidden_states = nn.functional.gelu(hidden_states, approximate="tanh") 
         hidden_states = self.fc2(hidden_states) 
         return hidden_states
+    
 
 class SiglipAttention(nn.Module):
 
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)    
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.embed_dim = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.embed_dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        self.dropout = config.attention_dropout
+
+        self.k_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.v_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim)
+
+    def forward(self, hidden_states: torch.Tensor):
+        batch_size, num_patches, embed_dim = hidden_states.shape
+
+        # [b,s,d] -> [b,s,d] -> [b,s, num_heads, head_dim] -> [b, num_heads, s, head_dim]
+        q = self.q_proj(hidden_states).view(batch_size, num_patches, self.num_heads, self.head_dim).transpose(1,2)
+        k = self.k_proj(hidden_states).view(batch_size, num_patches, self.num_heads, self.head_dim).transpose(1,2)
+        v = self.v_proj(hidden_states).view(batch_size, num_patches, self.num_heads, self.head_dim).transpose(1,2)
+        
+        #[b, num_heads, s, head_dim] x [b, num_heads, head_dim, s] -> [b, num_heads, s, s]
+        attn_weights = (torch.matmul(q, k.transpose(2,3)) * self.scale)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+        attn_weights = nn.functional.dropout(attn_weights, p=self.dropout, training=self.training)
+        attn_output = torch.matmul(attn_weights, v) # [b, num_heads, s, head_dim]
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(batch_size, num_patches, embed_dim)
+
+        #multiply by out_proj to 'mix' the results from different heads
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output, attn_weights
 
 
-class SiglipEncoder(nn.Module):
+
+class SiglipEncoderLayer(nn.Module):
 
     def __init__(self, config: SiglipVisionConfig) -> None:
         super().__init__()
@@ -88,7 +123,22 @@ class SiglipEncoder(nn.Module):
         x2 = self.layer_norm2(x)
         x2 = self.mlp(x2)
         x += x2
-        return x    
+        return x 
+       
+
+class SiglipEncoder(nn.Module):
+    
+    def __init__(self, config: SiglipVisionConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(self.config.num_hidden_layers)])
+
+    def forward(self, input_embeds: torch.Tensor):
+        hidden_states = input_embeds
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+
+        return hidden_states        
 
 
 
